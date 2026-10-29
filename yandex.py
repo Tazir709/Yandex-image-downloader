@@ -506,11 +506,16 @@ class YandexImagesDownloader:
 
                 
                 print("\n" + "=" * 60)
-                print("MANUAL BROWSER STEP")
-                print("1. Click 'Show more' to load additional results.")
-                print("2. Image URLs are captured automatically as results appear.")
-                print("3. If a CAPTCHA appears, solve it in the browser to continue.")
-                print("4. Return to this console and press Enter when finished.")
+                print("""MANUAL BROWSER STEPS
+                1. Click 'Show more' to load additional image results.
+                2. Image URLs are captured automatically as results appear.
+                3. Repeat as needed: click 'Show more' to load more results
+                and solve any CAPTCHA that appears to continue browsing.
+                4. Once you've collected enough images, return to this
+                console and press Enter to start downloading.
+                ============================================================
+                Waiting for you to finish loading images...
+                """)
                 print("=" * 60)
 
                 collected_urls = set()
