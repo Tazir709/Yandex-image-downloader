@@ -5,13 +5,27 @@ import os
 import re
 import threading
 import time
-import uuid
 from pathlib import PurePosixPath
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 from PIL import Image, UnidentifiedImageError
 from playwright.sync_api import Error as PlaywrightError, sync_playwright
+
+
+def _parse_min_size(value):
+    match = re.fullmatch(r"\s*(\d+)\s*[xX]\s*(\d+)\s*", value)
+    if not match:
+        raise argparse.ArgumentTypeError(
+            "minimum size must use WIDTHxHEIGHT format, for example 400x400"
+        )
+
+    width, height = (int(dimension) for dimension in match.groups())
+    if width < 1 or height < 1:
+        raise argparse.ArgumentTypeError(
+            "minimum width and height must be greater than zero"
+        )
+    return width, height
 
 
 class YandexImagesDownloader:
@@ -45,8 +59,8 @@ class YandexImagesDownloader:
 
         return candidate
 
-    @classmethod
-    def _save_valid_image(cls, directory, image_url, response):
+    @staticmethod
+    def _inspect_image(response):
         if response.status_code < 200 or response.status_code >= 300:
             return None, f"HTTP {response.status_code}"
 
@@ -56,6 +70,7 @@ class YandexImagesDownloader:
         try:
             with Image.open(BytesIO(response.content)) as image:
                 image_format = image.format
+                dimensions = image.size
                 image.load()
         except (
             Image.DecompressionBombError,
@@ -65,6 +80,31 @@ class YandexImagesDownloader:
         ) as error:
             return None, f"Invalid or unreadable image: {error}"
 
+        if not image_format:
+            return None, "Image format could not be determined"
+
+        return (image_format, dimensions), None
+
+    @classmethod
+    def _save_valid_image(
+        cls,
+        directory,
+        image_url,
+        response,
+        image_info=None
+    ):
+        if response.status_code < 200 or response.status_code >= 300:
+            return None, f"HTTP {response.status_code}"
+
+        if not response.content:
+            return None, "Empty response"
+
+        if image_info is None:
+            image_info, error = cls._inspect_image(response)
+            if error:
+                return None, error
+
+        image_format = image_info[0]
         format_extensions = {
             "AVIF": ".avif",
             "BMP": ".bmp",
@@ -202,7 +242,15 @@ class YandexImagesDownloader:
 
 
     
-    def crawl_source_pages(self, page, entities, max_source_pages=10):
+    def crawl_source_pages(
+        self,
+        page,
+        entities,
+        max_source_pages=10,
+        progress_callback=None,
+        image_callback=None,
+        existing_image_urls=None
+    ):
         """Collect additional images from Yandex results' source pages."""
         source_pages = []
         seen_pages = set()
@@ -232,7 +280,7 @@ class YandexImagesDownloader:
                 source_pages.append(source_url)
 
         discovered = []
-        seen_images = set()
+        seen_images = set(existing_image_urls or ())
 
         # Avoid redownloading images already represented by Yandex results.
         for entity in entities:
@@ -240,23 +288,43 @@ class YandexImagesDownloader:
             if original:
                 seen_images.add(original)
 
-        for source_url in source_pages[:max_source_pages]:
+        pages_to_scan = source_pages[:max_source_pages]
+        if progress_callback:
+            progress_callback(
+                0,
+                len(pages_to_scan),
+                "Preparing source-page scan"
+            )
+
+        for completed, source_url in enumerate(pages_to_scan, start=1):
             print(f"Depth 1: Visiting {source_url}")
 
             try:
                 images = self.get_images_from_source_page(page, source_url)
+                page_discovered = []
 
                 for image_url in images:
                     if image_url not in seen_images:
                         seen_images.add(image_url)
-                        discovered.append({
+                        image = {
                             "url": image_url,
                             "source_page": source_url,
                             "depth": 1,
-                        })
+                        }
+                        discovered.append(image)
+                        page_discovered.append(image_url)
+                if image_callback:
+                    image_callback(page_discovered)
 
             except Exception as e:
                 print(f"Failed to crawl {source_url}: {e}")
+            finally:
+                if progress_callback:
+                    progress_callback(
+                        completed,
+                        len(pages_to_scan),
+                        f"Scanned source page {completed} of {len(pages_to_scan)}"
+                    )
 
         print(f"Discovered {len(discovered)} additional image URLs.")
         return discovered
@@ -268,7 +336,8 @@ class YandexImagesDownloader:
         page,
         imgs_count,
         sub_directory=None,
-        depth=1
+        depth=1,
+        min_size=None
     ):
         """
         Open Yandex Images for manual result loading, then download its images.
@@ -278,13 +347,27 @@ class YandexImagesDownloader:
         download_dir = os.path.join(self.output_dir, search_directory)
         os.makedirs(download_dir, exist_ok=True)
 
-        def report_progress(label, completed, total, succeeded, skipped):
+        def report_progress(
+            label,
+            completed,
+            total,
+            succeeded,
+            skipped,
+            progress_detail=None
+        ):
             failed = completed - succeeded - skipped
             print(
                 f"\r{label}: {completed}/{total} "
                 f"({succeeded} saved, {skipped} skipped, {failed} failed)",
                 end="\n" if completed == total else "",
                 flush=True
+            )
+            update_panel_progress(
+                label,
+                completed,
+                total,
+                progress_detail
+                or f"{succeeded} saved, {skipped} skipped, {failed} failed"
             )
         
         # Construct URL with pagination
@@ -304,69 +387,529 @@ class YandexImagesDownloader:
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
             page_obj = context.new_page()
-            capture_storage_key = f"yandex_image_urls_{uuid.uuid4().hex}"
+            collected_urls = set()
+            page_image_counts = {}
+            seen_batches = set()
+            qualifying_count = 0
+            filtered_count = 0
+            image_dimension_cache = {}
+            input_finished = threading.Event()
+            captcha_active = False
+
+            def update_panel_progress(label, completed, total, detail):
+                if page_obj.is_closed():
+                    return
+
+                try:
+                    page_obj.evaluate(
+                        """progress => {
+                            if (typeof window.__yandexCollectorRender === "function") {
+                                window.__yandexCollectorRender(progress);
+                            }
+                        }""",
+                        {
+                            "progress": {
+                                "stage": label,
+                                "completed": completed,
+                                "total": total,
+                                "detail": detail,
+                            }
+                        }
+                    )
+                except PlaywrightError as error:
+                    print(f"Could not update progress panel: {error}")
+
+            def register_image_urls(image_urls):
+                new_urls = []
+                for image_url in image_urls:
+                    if (
+                        isinstance(image_url, str)
+                        and urlparse(image_url).scheme in {"http", "https"}
+                        and urlparse(image_url).netloc
+                        and image_url not in collected_urls
+                    ):
+                        collected_urls.add(image_url)
+                        new_urls.append(image_url)
+                return new_urls
+
+            def update_panel_unique_count():
+                if page_obj.is_closed():
+                    return
+
+                try:
+                    page_obj.evaluate(
+                        """counts => {
+                            if (typeof window.__yandexCollectorRender === "function") {
+                                window.__yandexCollectorRender(counts);
+                            }
+                        }""",
+                        {
+                            "uniqueCount": len(collected_urls),
+                            "qualifyingCount": qualifying_count,
+                            "filteredCount": filtered_count,
+                        }
+                    )
+                except PlaywrightError as error:
+                    print(f"Could not update unique image count: {error}")
+
+            def report_capture(_source, payload):
+                nonlocal qualifying_count, filtered_count
+
+                if not isinstance(payload, dict):
+                    raise ValueError("Invalid Yandex capture payload.")
+
+                page_number = str(payload.get("pageNumber") or "unknown")
+                new_urls = register_image_urls(payload.get("urls", []))
+
+                if new_urls:
+                    page_image_counts[page_number] = (
+                        page_image_counts.get(page_number, 0) + len(new_urls)
+                    )
+                    batch_id = payload.get("batchId")
+                    if isinstance(batch_id, str) and batch_id:
+                        seen_batches.add(batch_id)
+
+                return {
+                    "uniqueCount": len(collected_urls),
+                    "qualifyingCount": qualifying_count,
+                    "filteredCount": filtered_count,
+                    "batchCount": len(seen_batches),
+                    "lastUpdate": "Just now",
+                }
+
+            def finish_capture(_source):
+                input_finished.set()
+
+            def download_candidates(
+                candidates,
+                limit,
+                directory,
+                stage,
+                timeout,
+                headers=None
+            ):
+                nonlocal qualifying_count, filtered_count
+
+                target_count = max(0, limit)
+                candidates_to_check = (
+                    candidates
+                    if min_size is not None
+                    else candidates[:target_count]
+                )
+                os.makedirs(directory, exist_ok=True)
+                saved = 0
+                skipped = 0
+                failed = 0
+                filtered_in_stage = 0
+                processed = 0
+
+                for item in candidates_to_check:
+                    if saved >= target_count:
+                        break
+
+                    image_url = item["url"] if isinstance(item, dict) else item
+                    metadata = (
+                        {
+                            "source_page": item["source_page"],
+                            "depth": item.get("depth", 1),
+                        }
+                        if isinstance(item, dict)
+                        else {}
+                    )
+
+                    if image_url in image_dimension_cache:
+                        continue
+
+                    processed += 1
+                    try:
+                        response = requests.get(
+                            image_url,
+                            timeout=timeout,
+                            headers=headers
+                        )
+                        image_info, inspect_error = self._inspect_image(response)
+                        image_dimension_cache[image_url] = (
+                            image_info,
+                            inspect_error
+                        )
+
+                        if inspect_error:
+                            img_url_results.append({
+                                "status": "skipped",
+                                "url": image_url,
+                                "error": inspect_error,
+                                **metadata,
+                            })
+                            skipped += 1
+                        else:
+                            image_width, image_height = image_info[1]
+                            below_minimum = (
+                                min_size is not None
+                                and (
+                                    image_width < min_size[0]
+                                    or image_height < min_size[1]
+                                )
+                            )
+                            if below_minimum:
+                                filtered_count += 1
+                                filtered_in_stage += 1
+                                skipped += 1
+                                img_url_results.append({
+                                    "status": "skipped",
+                                    "url": image_url,
+                                    "error": (
+                                        f"Image is {image_width}x{image_height}; "
+                                        f"minimum is {min_size[0]}x{min_size[1]}"
+                                    ),
+                                    **metadata,
+                                })
+                            else:
+                                qualifying_count += 1
+                                filepath, save_error = self._save_valid_image(
+                                    directory,
+                                    image_url,
+                                    response,
+                                    image_info=image_info
+                                )
+                                if filepath:
+                                    img_url_results.append({
+                                        "status": "success",
+                                        "url": image_url,
+                                        "path": filepath,
+                                        **metadata,
+                                    })
+                                    saved += 1
+                                else:
+                                    img_url_results.append({
+                                        "status": "skipped",
+                                        "url": image_url,
+                                        "error": save_error,
+                                        **metadata,
+                                    })
+                                    skipped += 1
+
+                    except Exception as error:
+                        img_url_results.append({
+                            "status": "fail",
+                            "url": image_url,
+                            "error": str(error),
+                            **metadata,
+                        })
+                        failed += 1
+
+                    report_progress(
+                        stage,
+                        processed,
+                        len(candidates_to_check),
+                        saved,
+                        skipped,
+                        progress_detail=(
+                            f"{saved} saved, {filtered_in_stage} filtered, "
+                            f"{skipped - filtered_in_stage} skipped, "
+                            f"{failed} failed"
+                        )
+                    )
+
+                    update_panel_unique_count()
+                    time.sleep(0.5)
+
+                if processed != len(candidates_to_check):
+                    report_progress(
+                        stage,
+                        processed,
+                        processed,
+                        saved,
+                        skipped,
+                        progress_detail=(
+                            f"{saved} saved, {filtered_in_stage} filtered, "
+                            f"{skipped - filtered_in_stage} skipped, "
+                            f"{failed} failed"
+                        )
+                    )
+
+            page_obj.expose_binding("__yandexReportCapture", report_capture)
+            page_obj.expose_binding("__finishYandexCapture", finish_capture)
             capture_script = r"""
                 (() => {
-                    if (window.__yandexCapturedImageUrls) return;
+                    if (window.top !== window || window.__yandexCollectorPanel) return;
+                    window.__yandexCollectorPanel = true;
 
-                    const storageKey = __CAPTURE_STORAGE_KEY__;
-                    let storedUrlsByPage = {};
-                    try {
-                        storedUrlsByPage = JSON.parse(
-                            localStorage.getItem(storageKey) || "[]"
-                        );
-                    } catch {
-                        storedUrlsByPage = {};
+                    const seenInDocument = new Set();
+                    const pendingUrls = new Set();
+                    let flushTimer = null;
+                    let lastCaptchaState = null;
+
+                    function isCaptcha() {
+                        return /\/showcaptcha\/?$/i.test(location.pathname);
                     }
 
-                    if (
-                        !storedUrlsByPage ||
-                        typeof storedUrlsByPage !== "object" ||
-                        Array.isArray(storedUrlsByPage)
-                    ) {
-                        storedUrlsByPage = {};
-                    }
+                    function mountPanel() {
+                        const host = document.createElement("div");
+                        host.id = "yandex-image-collector";
+                        host.style.cssText = [
+                            "all:initial",
+                            "position:fixed",
+                            "right:20px",
+                            "bottom:20px",
+                            "z-index:2147483647"
+                        ].join(";");
+                        const shadow = host.attachShadow({ mode: "open" });
+                        shadow.innerHTML = `
+                            <style>
+                                :host { all: initial; }
+                                .panel {
+                                    box-sizing: border-box;
+                                    width: 310px;
+                                    padding: 18px;
+                                    border: 1px solid #e5e7eb;
+                                    border-radius: 14px;
+                                    background: #fff;
+                                    box-shadow: 0 12px 36px #0003;
+                                    color: #111827;
+                                    font: 14px/1.45 Arial, sans-serif;
+                                }
+                                .header, .status, .metric {
+                                    display: flex;
+                                    align-items: center;
+                                    justify-content: space-between;
+                                }
+                                .title { font-size: 16px; font-weight: 700; }
+                                .status { justify-content: flex-start; gap: 7px; margin-top: 12px; }
+                                .dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; }
+                                .dot.captcha { background: #f59e0b; }
+                                .dot.progress { background: #2563eb; }
+                                .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 16px; }
+                                .metric {
+                                    align-items: flex-start;
+                                    flex-direction: column;
+                                    padding: 11px;
+                                    border-radius: 9px;
+                                    background: #f3f4f6;
+                                }
+                                .value { font-size: 22px; font-weight: 700; }
+                                .label, .last-update, .hint { color: #6b7280; font-size: 12px; }
+                                .last-update { margin-top: 13px; }
+                                .hint { min-height: 32px; margin: 8px 0 14px; }
+                                .progress-section { margin-top: 15px; }
+                                .progress-meta {
+                                    display: flex;
+                                    justify-content: space-between;
+                                    gap: 8px;
+                                    margin-bottom: 7px;
+                                    font-size: 12px;
+                                    font-weight: 700;
+                                }
+                                .progress-track {
+                                    height: 8px;
+                                    overflow: hidden;
+                                    border-radius: 999px;
+                                    background: #e5e7eb;
+                                }
+                                .progress-fill {
+                                    width: 0;
+                                    height: 100%;
+                                    border-radius: inherit;
+                                    background: #2563eb;
+                                    transition: width 180ms ease;
+                                }
+                                .progress-detail {
+                                    margin-top: 6px;
+                                    color: #6b7280;
+                                    font-size: 11px;
+                                }
+                                button {
+                                    width: 100%;
+                                    padding: 10px 12px;
+                                    border: 0;
+                                    border-radius: 8px;
+                                    background: #2563eb;
+                                    color: white;
+                                    cursor: pointer;
+                                    font: inherit;
+                                    font-weight: 700;
+                                }
+                                button:disabled { cursor: wait; opacity: .7; }
+                            </style>
+                            <section class="panel" aria-label="Yandex Image Downloader">
+                                <div class="header">
+                                    <span class="title">Yandex Image Downloader</span>
+                                </div>
+                                <div class="status" role="status">
+                                    <span class="dot"></span>
+                                    <strong class="status-text">Capturing</strong>
+                                </div>
+                                <div class="metrics">
+                                    <div class="metric">
+                                        <span class="value unique-count">0</span>
+                                        <span class="label">Unique images</span>
+                                    </div>
+                                    <div class="metric">
+                                        <span class="value qualifying-count">0</span>
+                                        <span class="label">Qualifying</span>
+                                    </div>
+                                    <div class="metric">
+                                        <span class="value filtered-count">0</span>
+                                        <span class="label">Filtered out</span>
+                                    </div>
+                                    <div class="metric">
+                                        <span class="value batch-count">0</span>
+                                        <span class="label">Result batches</span>
+                                    </div>
+                                </div>
+                                <div class="last-update">Last update: <span>Just now</span></div>
+                                <p class="hint">Click Show more on Yandex to collect additional results.</p>
+                                <div class="progress-section" hidden>
+                                    <div class="progress-meta">
+                                        <span class="progress-title"></span>
+                                        <span class="progress-count"></span>
+                                    </div>
+                                    <div
+                                        class="progress-track"
+                                        role="progressbar"
+                                        aria-valuemin="0"
+                                        aria-valuemax="100"
+                                        aria-valuenow="0"
+                                    >
+                                        <div class="progress-fill"></div>
+                                    </div>
+                                    <div class="progress-detail"></div>
+                                </div>
+                                <button type="button">Finish and download</button>
+                            </section>
+                        `;
 
-                    const urlsByPage = new Map(
-                        Object.entries(storedUrlsByPage).map(
-                            ([page, urls]) => [page, new Set(urls)]
-                        )
-                    );
-                    const urls = new Set(
-                        [...urlsByPage.values()].flatMap(pageUrls => [...pageUrls])
-                    );
-                    window.__yandexCapturedImageUrls = urls;
-                    window.__yandexCapturedImageUrlsByPage = urlsByPage;
+                        const statusText = shadow.querySelector(".status-text");
+                        const dot = shadow.querySelector(".dot");
+                        const uniqueCount = shadow.querySelector(".unique-count");
+                        const qualifyingCount = shadow.querySelector(".qualifying-count");
+                        const filteredCount = shadow.querySelector(".filtered-count");
+                        const batchCount = shadow.querySelector(".batch-count");
+                        const lastUpdate = shadow.querySelector(".last-update span");
+                        const hint = shadow.querySelector(".hint");
+                        const progressSection = shadow.querySelector(".progress-section");
+                        const progressTitle = shadow.querySelector(".progress-title");
+                        const progressCount = shadow.querySelector(".progress-count");
+                        const progressTrack = shadow.querySelector(".progress-track");
+                        const progressFill = shadow.querySelector(".progress-fill");
+                        const progressDetail = shadow.querySelector(".progress-detail");
+                        const finishButton = shadow.querySelector("button");
+                        let currentProgress = null;
 
-                    function persistUrls() {
-                        try {
-                            localStorage.setItem(
-                                storageKey,
-                                JSON.stringify(
-                                    Object.fromEntries(
-                                        [...urlsByPage].map(
-                                            ([page, pageUrls]) => [
-                                                page,
-                                                [...pageUrls]
-                                            ]
-                                        )
-                                    )
-                                )
-                            );
-                        } catch {
-                            // Keep the in-memory collection if storage is unavailable.
+                        function render(snapshot = {}) {
+                            if (snapshot.progress) {
+                                currentProgress = snapshot.progress;
+                            }
+                            const captcha = isCaptcha();
+                            dot.classList.toggle("captcha", captcha);
+                            dot.classList.toggle("progress", Boolean(currentProgress));
+                            if (Number.isFinite(snapshot.uniqueCount)) {
+                                uniqueCount.textContent = snapshot.uniqueCount;
+                            }
+                            if (Number.isFinite(snapshot.qualifyingCount)) {
+                                qualifyingCount.textContent = snapshot.qualifyingCount;
+                            }
+                            if (Number.isFinite(snapshot.filteredCount)) {
+                                filteredCount.textContent = snapshot.filteredCount;
+                            }
+                            if (Number.isFinite(snapshot.batchCount)) {
+                                batchCount.textContent = snapshot.batchCount;
+                            }
+                            if (snapshot.lastUpdate) {
+                                lastUpdate.textContent = snapshot.lastUpdate;
+                            }
+
+                            if (currentProgress) {
+                                const completed = Math.max(
+                                    0,
+                                    Number(currentProgress.completed) || 0
+                                );
+                                const total = Math.max(
+                                    0,
+                                    Number(currentProgress.total) || 0
+                                );
+                                const percent = total
+                                    ? Math.min(100, Math.round(completed / total * 100))
+                                    : 100;
+                                progressSection.hidden = false;
+                                progressTitle.textContent = currentProgress.stage;
+                                progressCount.textContent = `${completed} / ${total}`;
+                                progressTrack.setAttribute("aria-valuenow", percent);
+                                progressFill.style.width = `${percent}%`;
+                                progressDetail.textContent = currentProgress.detail || "";
+                                statusText.textContent = currentProgress.stage;
+                                hint.textContent = currentProgress.detail || "Working...";
+                            } else {
+                                statusText.textContent = captcha
+                                    ? "CAPTCHA challenge"
+                                    : "Capturing";
+                                hint.textContent = captcha
+                                    ? "Solve the CAPTCHA in the browser, then continue collecting."
+                                    : "Click Show more on Yandex to collect additional results.";
+                            }
                         }
+
+                        finishButton.addEventListener("click", async () => {
+                            finishButton.disabled = true;
+                            finishButton.textContent = "Preparing download...";
+                            hint.textContent = "Finishing collection and preparing downloads.";
+                            try {
+                                await window.__finishYandexCapture();
+                            } catch (error) {
+                                finishButton.disabled = false;
+                                finishButton.textContent = "Finish and download";
+                                hint.textContent = `Could not finish: ${error.message}`;
+                            }
+                        });
+
+                        document.documentElement.appendChild(host);
+                        render();
+                        window.__yandexCollectorRender = render;
+                    }
+
+                    function report(urls, batchId = null) {
+                        const pageNumber = new URL(location.href)
+                            .searchParams.get("p") || "unknown";
+                        return window.__yandexReportCapture({
+                            urls,
+                            pageNumber,
+                            batchId,
+                            isCaptcha: isCaptcha()
+                        }).then(snapshot => {
+                            window.__yandexCollectorRender?.(snapshot);
+                        });
+                    }
+
+                    function createBatchId() {
+                        if (typeof crypto.randomUUID === "function") {
+                            return crypto.randomUUID();
+                        }
+                        return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+                    }
+
+                    function flushPendingUrls() {
+                        flushTimer = null;
+                        if (!pendingUrls.size || isCaptcha()) return;
+                        const urls = [...pendingUrls];
+                        pendingUrls.clear();
+                        report(urls, createBatchId()).catch(error => {
+                            urls.forEach(url => pendingUrls.add(url));
+                            const hint = document.querySelector(
+                                "#yandex-image-collector"
+                            )?.shadowRoot?.querySelector(".hint");
+                            if (hint) {
+                                hint.textContent = `Capture connection error: ${error.message}`;
+                            }
+                            flushTimer = window.setTimeout(flushPendingUrls, 1500);
+                        });
                     }
 
                     function captureLinks(root = document) {
-                        if (/\/showcaptcha\/?$/i.test(location.pathname)) {
+                        if (isCaptcha()) {
+                            window.__yandexCollectorRender?.();
                             return;
                         }
 
                         const links = [];
-                        let added = false;
-                        const currentPageNumber = new URL(location.href)
-                            .searchParams.get("p") || "unknown";
                         if (
                             root instanceof Element &&
                             root.matches('a[href*="img_url="]')
@@ -374,84 +917,88 @@ class YandexImagesDownloader:
                             links.push(root);
                         }
                         if (root.querySelectorAll) {
-                            links.push(
-                                ...root.querySelectorAll('a[href*="img_url="]')
-                            );
+                            links.push(...root.querySelectorAll('a[href*="img_url="]'));
                         }
 
                         for (const link of links) {
                             try {
                                 const resultUrl = new URL(link.href);
                                 const imageUrl = resultUrl.searchParams.get("img_url");
-                                const pageNumber = currentPageNumber;
-
                                 if (
                                     imageUrl &&
-                                    /^https?:\/\//i.test(imageUrl)
+                                    /^https?:\/\//i.test(imageUrl) &&
+                                    !seenInDocument.has(imageUrl)
                                 ) {
-                                    if (!urlsByPage.has(pageNumber)) {
-                                        urlsByPage.set(pageNumber, new Set());
-                                    }
-                                    const pageUrls = urlsByPage.get(pageNumber);
-
-                                    if (!urls.has(imageUrl)) {
-                                        added = true;
-                                    }
-                                    urls.add(imageUrl);
-                                    if (!pageUrls.has(imageUrl)) {
-                                        added = true;
-                                        pageUrls.add(imageUrl);
-                                    }
+                                    seenInDocument.add(imageUrl);
+                                    pendingUrls.add(imageUrl);
                                 }
                             } catch {
                                 // Ignore malformed result links.
                             }
                         }
 
-                        if (added) {
-                            persistUrls();
+                        if (pendingUrls.size && !flushTimer) {
+                            flushTimer = window.setTimeout(flushPendingUrls, 700);
                         }
                     }
 
-                    const observer = new MutationObserver(mutations => {
-                        for (const mutation of mutations) {
-                            if (mutation.type === "attributes") {
-                                captureLinks(mutation.target);
-                            } else {
-                                for (const node of mutation.addedNodes) {
-                                    if (node instanceof Element) {
-                                        captureLinks(node);
+                    function startCapture() {
+                        mountPanel();
+                        report([]).catch(error => {
+                            const hint = document.querySelector(
+                                "#yandex-image-collector"
+                            )?.shadowRoot?.querySelector(".hint");
+                            if (hint) {
+                                hint.textContent = `Capture connection error: ${error.message}`;
+                            }
+                        });
+                        captureLinks();
+                        const observer = new MutationObserver(mutations => {
+                            for (const mutation of mutations) {
+                                if (mutation.type === "attributes") {
+                                    captureLinks(mutation.target);
+                                } else {
+                                    for (const node of mutation.addedNodes) {
+                                        if (node instanceof Element) {
+                                            captureLinks(node);
+                                        }
                                     }
                                 }
                             }
-                        }
-                    });
-
-                    function startCapture() {
-                        captureLinks();
+                        });
                         observer.observe(document.documentElement, {
                             attributes: true,
                             attributeFilter: ["href"],
                             childList: true,
                             subtree: true
                         });
-                        window.setInterval(captureLinks, 300);
+                        window.setInterval(() => {
+                            const captcha = isCaptcha();
+                            if (captcha !== lastCaptchaState) {
+                                lastCaptchaState = captcha;
+                                window.__yandexCollectorRender?.();
+                                report([]).catch(error => {
+                                    const hint = document.querySelector(
+                                        "#yandex-image-collector"
+                                    )?.shadowRoot?.querySelector(".hint");
+                                    if (hint) {
+                                        hint.textContent = `Capture connection error: ${error.message}`;
+                                    }
+                                });
+                            }
+                            captureLinks();
+                        }, 500);
                     }
 
                     if (document.documentElement) {
                         startCapture();
                     } else {
-                        document.addEventListener(
-                            "DOMContentLoaded",
-                            startCapture,
-                            { once: true }
-                        );
+                        document.addEventListener("DOMContentLoaded", startCapture, {
+                            once: true
+                        });
                     }
                 })();
-            """.replace(
-                "__CAPTURE_STORAGE_KEY__",
-                json.dumps(capture_storage_key)
-            )
+            """
             page_obj.add_init_script(capture_script)
             source_browser = None
             
@@ -506,36 +1053,19 @@ class YandexImagesDownloader:
 
                 
                 print("\n" + "=" * 60)
-                print("""MANUAL BROWSER STEPS
-                1. Click 'Show more' to load additional image results.
-                2. Image URLs are captured automatically as results appear.
-                3. Repeat as needed: click 'Show more' to load more results
-                and solve any CAPTCHA that appears to continue browsing.
-                4. Once you've collected enough images, return to this
-                console and press Enter to start downloading.
-                ============================================================
-                Waiting for you to finish loading images...
-                """)
+                print(
+                    "MANUAL BROWSER STEPS\n"
+                    "1. Click 'Show more' to load additional image results.\n"
+                    "2. Image URLs are captured automatically as results appear.\n"
+                    "3. Repeat as needed: click 'Show more' to load more results\n"
+                    "   and solve any CAPTCHA that appears to continue browsing.\n"
+                    "4. Click 'Finish and download' in the floating panel, or\n"
+                    "   return to this console and press Enter."
+                )
                 print("=" * 60)
 
-                collected_urls = set()
-                page_image_counts = {}
                 reported_pages = set()
                 entity_list = get_entities(read_state())
-                input_finished = threading.Event()
-
-                def process_captured_urls(captures):
-                    by_page = captures.get("byPage", {})
-                    for page_number, page_urls in by_page.items():
-                        if page_number not in page_image_counts:
-                            page_image_counts[page_number] = 0
-
-                        page_count = page_image_counts.setdefault(page_number, 0)
-                        for image_url in page_urls:
-                            if image_url not in collected_urls:
-                                collected_urls.add(image_url)
-                                page_count += 1
-                        page_image_counts[page_number] = page_count
 
                 def report_page(page_number):
                     if page_number in reported_pages:
@@ -570,131 +1100,54 @@ class YandexImagesDownloader:
                         input_finished.set()
 
                 threading.Thread(target=wait_for_enter, daemon=True).start()
-                read_urls_script = r"""
-                    () => {
-                        const byPage = {};
-                        const currentUrl = new URL(location.href);
-                        const isCaptcha = /\/showcaptcha\/?$/i.test(
-                            currentUrl.pathname
-                        );
-                        const currentPage = isCaptcha
-                            ? null
-                            : currentUrl.searchParams.get("p") || "unknown";
-
-                        for (
-                            const [page, urls] of
-                            (window.__yandexCapturedImageUrlsByPage || new Map())
-                        ) {
-                            byPage[page] = [...urls];
-                        }
-
-                        try {
-                            const storedByPage = JSON.parse(
-                                localStorage.getItem(__CAPTURE_STORAGE_KEY__)
-                                || "{}"
-                            );
-                            for (const [page, urls] of Object.entries(storedByPage)) {
-                                byPage[page] = [
-                                    ...new Set([...(byPage[page] || []), ...urls])
-                                ];
-                            }
-                        } catch {}
-
-                        if (currentPage !== null) {
-                            if (!byPage[currentPage]) byPage[currentPage] = [];
-                            const currentUrls = new Set(byPage[currentPage]);
-                            for (const link of document.querySelectorAll(
-                                'a[href*="img_url="]'
-                            )) {
-                                try {
-                                    const resultUrl = new URL(link.href);
-                                    const url = resultUrl.searchParams.get("img_url");
-                                    if (url && /^https?:\/\//i.test(url)) {
-                                        currentUrls.add(url);
-                                    }
-                                } catch {}
-                            }
-
-                            byPage[currentPage] = [...currentUrls];
-                        }
-
-                        return { byPage, currentPage, isCaptcha };
-                    }
-                """.replace(
-                    "__CAPTURE_STORAGE_KEY__",
-                    json.dumps(capture_storage_key)
-                )
 
                 last_new_entity_read = 0.0
                 last_page_number = None
-                captcha_active = False
                 while not input_finished.is_set() and not page_obj.is_closed():
-                    try:
-                        captures = page_obj.evaluate(read_urls_script)
-                        current_page_number = captures.get("currentPage")
-                        captcha_detected = captures.get("isCaptcha", False)
+                    current_url = page_obj.url
+                    parsed_url = urlparse(current_url)
+                    captcha_detected = (
+                        parsed_url.path.rstrip("/").lower() == "/showcaptcha"
+                    )
+                    current_page_number = (
+                        None
+                        if captcha_detected
+                        else parse_qs(parsed_url.query).get("p", ["unknown"])[0]
+                    )
+                    if (
+                        last_page_number is not None
+                        and current_page_number != last_page_number
+                    ):
+                        report_page(last_page_number)
+                    last_page_number = current_page_number
 
-                        process_captured_urls(captures)
-                        if (
-                            last_page_number is not None
-                            and current_page_number != last_page_number
-                        ):
+                    if captcha_detected and not captcha_active:
+                        if last_page_number is not None:
                             report_page(last_page_number)
-                        last_page_number = current_page_number
-
-                        if captcha_detected and not captcha_active:
-                            print(
-                                "CAPTCHA detected. Solve it to scan the next "
-                                "page, or press Enter to finish."
-                            )
-                        elif not captcha_detected and captcha_active:
-                            print("CAPTCHA cleared. Continue loading results.")
-                        captcha_active = captcha_detected
-
-                        now = time.monotonic()
-                        if now - last_new_entity_read >= 1:
-                            state = read_state()
-                            current_entities = get_entities(state)
-                            if current_entities:
-                                entity_list = current_entities
-                            last_new_entity_read = now
-                    except PlaywrightError:
-                        # Navigation can briefly destroy the execution context.
-                        current_url = page_obj.url
-                        captcha_detected = (
-                            urlparse(current_url).path.rstrip("/").lower()
-                            == "/showcaptcha"
+                            last_page_number = None
+                        print(
+                            "CAPTCHA detected. Solve it to scan the next "
+                            "page, or press Enter to finish."
                         )
-                        if captcha_detected and not captcha_active:
-                            if last_page_number is not None:
-                                report_page(last_page_number)
-                                last_page_number = None
-                            print(
-                                "CAPTCHA detected. Solve it to scan the next "
-                                "page, or press Enter to finish."
-                            )
-                        captcha_active = captcha_detected
+                    elif not captcha_detected and captcha_active:
+                        print("CAPTCHA cleared. Continue loading results.")
+                    captcha_active = captcha_detected
 
-                    time.sleep(0.25)
-
-                # Make one final attempt to collect links still present in the page.
-                if not page_obj.is_closed():
-                    try:
-                        captures = page_obj.evaluate(read_urls_script)
-                        process_captured_urls(captures)
-                        current_page_number = captures.get("currentPage")
-                        if (
-                            last_page_number is not None
-                            and current_page_number != last_page_number
-                        ):
-                            report_page(last_page_number)
-                        last_page_number = current_page_number
+                    now = time.monotonic()
+                    if now - last_new_entity_read >= 1:
                         state = read_state()
                         current_entities = get_entities(state)
                         if current_entities:
                             entity_list = current_entities
-                    except PlaywrightError:
-                        pass
+                        last_new_entity_read = now
+
+                    time.sleep(0.25)
+
+                if not page_obj.is_closed():
+                    state = read_state()
+                    current_entities = get_entities(state)
+                    if current_entities:
+                        entity_list = current_entities
 
                 if last_page_number is not None:
                     report_page(last_page_number)
@@ -720,49 +1173,13 @@ class YandexImagesDownloader:
                     "while browsing."
                 )
                 
-                # Download up to requested count
-                search_urls = unique_urls[:imgs_count]
-                search_succeeded = 0
-                search_skipped = 0
-                for completed, img_url in enumerate(search_urls, start=1):
-                    try:
-                        response = requests.get(img_url, timeout=10)
-                        filepath, error = self._save_valid_image(
-                            download_dir,
-                            img_url,
-                            response
-                        )
-                        if filepath:
-                            img_url_results.append({
-                                "status": "success",
-                                "url": img_url,
-                                "path": filepath
-                            })
-                            search_succeeded += 1
-                        else:
-                            img_url_results.append({
-                                "status": "skipped",
-                                "url": img_url,
-                                "error": error
-                            })
-                            search_skipped += 1
-                    except Exception as e:
-                        img_url_results.append({
-                            "status": "fail",
-                            "url": img_url,
-                            "error": str(e)
-                        })
-
-                    report_progress(
-                        "Search image downloads",
-                        completed,
-                        len(search_urls),
-                        search_succeeded,
-                        search_skipped
-                    )
-                    
-                    # Small delay to avoid rate limiting
-                    time.sleep(0.5)
+                download_candidates(
+                    unique_urls,
+                    imgs_count,
+                    download_dir,
+                    "Saving base images",
+                    timeout=10
+                )
                 if depth >= 1:
                     # Depth 1: visit source pages for the loaded search results once.
                     selected_entities = [
@@ -779,75 +1196,45 @@ class YandexImagesDownloader:
                         )
                     )
                     source_page = source_context.new_page()
+
+                    def report_source_scan_progress(completed, total, detail):
+                        update_panel_progress(
+                            "Scanning source pages",
+                            completed,
+                            total,
+                            detail
+                        )
+
+                    def report_source_candidates(image_urls):
+                        if register_image_urls(image_urls):
+                            update_panel_unique_count()
+
                     extra_images = self.crawl_source_pages(
                         source_page,
                         selected_entities,
-                        max_source_pages=1000
+                        max_source_pages=1000,
+                        progress_callback=report_source_scan_progress,
+                        image_callback=report_source_candidates,
+                        existing_image_urls=collected_urls
                     )
 
                     depth1_dir = os.path.join(download_dir, "depth_1")
                     os.makedirs(depth1_dir, exist_ok=True)
 
-                    depth1_images = extra_images[:imgs_count]
-                    depth1_succeeded = 0
-                    depth1_skipped = 0
-                    for completed, item in enumerate(depth1_images, start=1):
-                        img_url = item["url"]
-
-                        try:
-                            response = requests.get(
-                                img_url,
-                                timeout=15,
-                                headers={
-                                    "User-Agent": (
-                                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                        "AppleWebKit/537.36 Chrome/120.0.0.0 "
-                                        "Safari/537.36"
-                                    )
-                                }
+                    download_candidates(
+                        extra_images,
+                        imgs_count,
+                        depth1_dir,
+                        "Saving source images",
+                        timeout=15,
+                        headers={
+                            "User-Agent": (
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                "AppleWebKit/537.36 Chrome/120.0.0.0 "
+                                "Safari/537.36"
                             )
-                            filepath, error = self._save_valid_image(
-                                depth1_dir,
-                                img_url,
-                                response
-                            )
-                            if filepath:
-                                img_url_results.append({
-                                    "status": "success",
-                                    "url": img_url,
-                                    "path": filepath,
-                                    "source_page": item["source_page"],
-                                    "depth": 1,
-                                })
-                                depth1_succeeded += 1
-                            else:
-                                img_url_results.append({
-                                    "status": "skipped",
-                                    "url": img_url,
-                                    "error": error,
-                                    "source_page": item["source_page"],
-                                    "depth": 1,
-                                })
-                                depth1_skipped += 1
-
-                        except Exception as e:
-                            img_url_results.append({
-                                "status": "fail",
-                                "url": img_url,
-                                "error": str(e),
-                                "source_page": item["source_page"],
-                                "depth": 1,
-                            })
-
-                        report_progress(
-                            "Depth-1 downloads",
-                            completed,
-                            len(depth1_images),
-                            depth1_succeeded,
-                            depth1_skipped
-                        )
-
-                        time.sleep(0.5)
+                        }
+                    )
 
 
             except Exception as e:
@@ -882,6 +1269,15 @@ def main():
         help="Maximum number of search result images to download (default: 100)."
     )
     parser.add_argument(
+        "--min-size",
+        type=_parse_min_size,
+        metavar="WIDTHxHEIGHT",
+        help=(
+            "Only save images at least this wide and high, for example "
+            "400x400. Without this option, all image sizes are eligible."
+        )
+    )
+    parser.add_argument(
         "--output",
         help="Output folder name under yandex_images (defaults to the search query)."
     )
@@ -900,7 +1296,8 @@ def main():
         page=args.page,
         imgs_count=args.count,
         sub_directory=args.output,
-        depth=args.depth
+        depth=args.depth,
+        min_size=args.min_size
     )
 
     succeeded = sum(result["status"] == "success" for result in results)
